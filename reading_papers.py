@@ -20,7 +20,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # 其他原有配置保持不变
-os.environ['ARK_API_KEY'] = '89f37545-ebf9-45b4-a537-fb281f2204c9'
+os.environ['ARK_API_KEY'] = ''
 
 client = Ark(
     base_url="https://ark.cn-beijing.volces.com/api/v3",
