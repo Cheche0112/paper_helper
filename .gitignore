@@ -169,3 +169,8 @@ cython_debug/
 
 # PyPI configuration file
 .pypirc
+
+# generated
+*.db
+*.pdf
+arxiv_pdfs/
