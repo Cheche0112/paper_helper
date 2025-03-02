@@ -142,6 +142,24 @@ class ArxivWorkflow:
         print("处理论文...")
         self.scraper.process_papers()
         
+        # 过滤出指定日期范围内的论文
+        if len(self.date_from) > 7 or len(self.date_until) > 7:  # 如果日期格式是YYYY-MM-DD
+            print("根据具体日期范围过滤论文...")
+            date_from_obj = datetime.strptime(self.date_from, "%Y-%m-%d")
+            date_until_obj = datetime.strptime(self.date_until, "%Y-%m-%d")
+            
+            # 过滤论文
+            filtered_papers = []
+            for paper in self.scraper.papers:
+                paper_date = paper.first_announced_date
+                if date_from_obj <= paper_date <= date_until_obj:
+                    filtered_papers.append(paper)
+            
+            # 更新论文列表
+            original_count = len(self.scraper.papers)
+            self.scraper.papers = filtered_papers
+            print(f"日期过滤: 从 {original_count} 篇论文中筛选出 {len(self.scraper.papers)} 篇在日期范围 {self.date_from} 到 {self.date_until} 内的论文")
+        
         # 导出为Markdown
         print("导出为Markdown...")
         self.scraper.paper_exporter.to_markdown(
@@ -1170,29 +1188,27 @@ async def main():
     try:
         # 添加命令行参数解析
         parser = argparse.ArgumentParser(description='arXiv论文爬取与分析工作流')
-        parser.add_argument('--date-from', type=str, help='开始日期 (YYYY-MM格式)')
-        parser.add_argument('--date-until', type=str, help='结束日期 (YYYY-MM格式)')
+        parser.add_argument('--date-from', type=str, help='开始日期 (YYYY-MM-DD格式)')
+        parser.add_argument('--date-until', type=str, help='结束日期 (YYYY-MM-DD格式)')
         parser.add_argument('--analyze-pdf', action='store_true', help='是否使用大模型分析PDF内容')
         args = parser.parse_args()
         
-        # 注意：arXiv API只接受年月格式的日期，不接受具体到日的日期
         # 使用命令行参数或默认值
-        date_from = args.date_from if args.date_from else "2025-02-01"
+        date_from = args.date_from if args.date_from else "2025-02-22"
         date_until = args.date_until if args.date_until else "2025-02-28"
         
-        # 确保日期格式正确（只保留年月部分）
-        if len(date_from) > 7:  # 如果格式是YYYY-MM-DD
-            date_from = date_from[:7] + "-01"  # 转换为YYYY-MM-01
-        if len(date_until) > 7:  # 如果格式是YYYY-MM-DD
-            # 获取月末日期
-            year, month = map(int, date_until[:7].split('-'))
-            if month == 12:
-                next_month = datetime(year + 1, 1, 1) - timedelta(days=1)
-            else:
-                next_month = datetime(year, month + 1, 1) - timedelta(days=1)
-            date_until = next_month.strftime("%Y-%m-%d")
-        
-        print(f"注意：arXiv API只接受年月格式的日期，实际搜索范围将是从{date_from[:7]}月到{date_until[:7]}月")
+        # 确保日期格式正确
+        try:
+            # 验证日期格式
+            datetime.strptime(date_from, "%Y-%m-%d")
+            datetime.strptime(date_until, "%Y-%m-%d")
+            
+            # 注意：虽然arXiv API通常只接受年月格式，但我们的爬虫会在内部处理具体到日的筛选
+            print(f"设置日期范围: {date_from} 到 {date_until}")
+            print(f"注意：arXiv API只接受年月格式的日期，但爬虫会在内部筛选出指定日期范围的论文")
+        except ValueError:
+            print("日期格式错误，请使用YYYY-MM-DD格式")
+            return
         
         # 创建工作流实例
         workflow = ArxivWorkflow(
