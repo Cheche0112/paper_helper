@@ -4,46 +4,73 @@ import sqlite3
 from langchain_community.document_loaders import PDFPlumberLoader
 from tqdm import tqdm
 
-from volcenginesdkarkruntime import Ark
+# 替换为硅基流动API
+import requests
+import json
 
-os.environ['ARK_API_KEY'] = '89f37545-ebf9-45b4-a537-fb281f2204c9'
+# 设置硅基流动API密钥和URL
+os.environ['SILICONFLOW_API_KEY'] = 'your_siliconflow_api_key_here'
 
-client = Ark(
-    base_url="https://ark.cn-beijing.volces.com/api/v3",
-    api_key=os.environ.get("ARK_API_KEY")
-)
+# 硅基流动API调用函数
+def call_siliconflow_api(messages, model="gpt-4"):
+    """调用硅基流动API"""
+    headers = {
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {os.environ.get('SILICONFLOW_API_KEY')}"
+    }
+    
+    payload = {
+        "model": model,
+        "messages": messages,
+        "temperature": 0.7,
+        "max_tokens": 2000
+    }
+    
+    response = requests.post(
+        "https://api.siliconflow.cn/v1/chat/completions",
+        headers=headers,
+        data=json.dumps(payload)
+    )
+    
+    if response.status_code == 200:
+        return response.json()
+    else:
+        raise Exception(f"API调用失败: {response.status_code}, {response.text}")
 
 def chat_v3(full_text, questions):
-
     results = []
 
     for question in questions:
-        """使用大模型API分析文本"""
-        sys_template = f"""
+        """使用硅基流动大模型API分析文本"""
+        sys_template = """
         你是一个专业文档分析助手，请根据以下文档内容回答问题。
         若文档中没有相关信息，请明确说明"根据文档内容无法回答该问题"。
         请根据问题要求给出简洁或者是具体详细的回答
         """
 
         user_question = f"""
-        文档内容：{full_text[:33000]}  # 截断处理避免超出token限制
+        文档内容：{full_text[:30000]}  # 截断处理避免超出token限制
     
         问题：{question}
         
         请按问题要求直接给出答案
         """
 
-        # Non-streaming:
-
-        completion = client.chat.completions.create(
-            model="ep-20250206224347-2mshv",
-            messages = [
-                {"role": "system", "content": sys_template},
-                {"role": "user", "content": user_question},
-            ],
-        )
-        print(completion.choices[0].message.content)
-        results.append(completion.choices[0].message.content)
+        messages = [
+            {"role": "system", "content": sys_template},
+            {"role": "user", "content": user_question}
+        ]
+        
+        try:
+            # 调用硅基流动API
+            response = call_siliconflow_api(messages, model="gpt-4")
+            content = response["choices"][0]["message"]["content"]
+            print(content)
+            results.append(content)
+        except Exception as e:
+            print(f"API调用失败: {str(e)}")
+            results.append("API调用失败，无法获取结果")
+            
     return results
 
 
@@ -138,22 +165,22 @@ if __name__ == "__main__":
         ,
 
         """
-        文档的主要研究内容是什么？回答这个问题是可相对详细一些，并侧重关注和考虑分析是否包含有“人格、性格(personality)”的部分,前提是有对应的内容,请你按以下格式输出：
+        文档的主要研究内容是什么？回答这个问题是可相对详细一些，并侧重关注和考虑分析是否包含有"人格、性格(personality)"的部分,前提是有对应的内容,请你按以下格式输出：
         主要内容: [文本描述]
         关于人格、性格: [文本描述]
         
-        请注意，关于人格、性格的内容如果没有，则标为“无”
+        请注意，关于人格、性格的内容如果没有，则标为"无"
         """
 
         ,
         """
-        论文使用的数据集有哪些？如果没有，则回答“无”，如果有请严格按以下格式列出：
+        论文使用的数据集有哪些？如果没有，则回答"无"，如果有请严格按以下格式列出：
         数据集: [数据集名称]
         数据集规模: [数据集规模]
         数据集形式: [数据集形式]
         地址: [数据集url]
         
-        如果上述格式对应的项（规模、形式、地址）没有，则标为“无”，请注意数据集名称不能为“无”
+        如果上述格式对应的项（规模、形式、地址）没有，则标为"无"，请注意数据集名称不能为"无"
         """
     ]
 

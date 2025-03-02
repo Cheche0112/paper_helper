@@ -5,6 +5,9 @@ import asyncio
 import re
 from datetime import datetime, timedelta, UTC
 from itertools import chain
+import ssl
+import logging
+import random
 
 import aiohttp
 from aiohttp import ClientTimeout
@@ -68,6 +71,7 @@ class ArxivScraper(object):
         self.paper_db = PaperDatabase()
         self.paper_exporter = PaperExporter(date_from, date_until, category_blacklist, category_whitelist)
         self.console = Console()
+        self.session = None
 
     @property
     def meta_data(self):
@@ -98,68 +102,125 @@ class ArxivScraper(object):
             f"date-year=&date-filter_by=date_range&date-from_date={date_from}&date-to_date={date_until}&"
             f"date-date_type={self.filt_date_by}&abstracts=show&size={self.step}&order={self.order}&start={start}"
         )
-    async def request(self, start):
-        """
-        异步请求网页，重试至多3次
-        """
-        error = 0
-        url = self.get_url(start)
-        while error <= 3:
+
+    async def create_session(self):
+        """创建会话"""
+        if self.session is None:
+            headers = {
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+            }
+            ssl_context = ssl.create_default_context()
+            ssl_context.check_hostname = False
+            ssl_context.verify_mode = ssl.CERT_NONE
+            connector = aiohttp.TCPConnector(ssl=ssl_context)
+            timeout = aiohttp.ClientTimeout(total=30)
+            self.session = aiohttp.ClientSession(timeout=timeout, connector=connector, headers=headers)
+        return self.session
+        
+    async def close_session(self):
+        """关闭会话"""
+        if self.session is not None:
+            await self.session.close()
+            self.session = None
+
+    async def fetch_content(self, url):
+        """获取网页内容"""
+        session = await self.create_session()
+        
+        for attempt in range(3):
             try:
-                async with aiohttp.ClientSession(trust_env=True, timeout=ClientTimeout(total=10)) as session:
-                    async with session.get(url, proxy=self.proxy) as response:
-                        response.raise_for_status()
+                # 添加随机延迟，避免请求过快
+                await asyncio.sleep(random.uniform(1, 3))
+                
+                async with session.get(url, proxy=self.proxy) as response:
+                    if response.status == 200:
                         content = await response.text()
-                        return content
+                        if content:
+                            return content
+                        else:
+                            logging.error(f"Empty content received from {url}")
+                    elif response.status == 429:  # Too Many Requests
+                        logging.error(f"Rate limited (429). Waiting before retry...")
+                        await asyncio.sleep(10 * (attempt + 1))  # 增加等待时间
+                    else:
+                        logging.error(f"HTTP {response.status} error for {url}")
+                        
+            except aiohttp.ClientError as e:
+                logging.error(f"Network error: {str(e)}")
+                if attempt < 2:
+                    await asyncio.sleep(5 * (attempt + 1))
+                continue
             except Exception as e:
-                error += 1
-                # self.console.log(f"[bold red]Request {start} cause error: ")
-                # self.console.print_exception()
-                # self.console.log(f"[bold red]Retrying {start}... {error}/
+                logging.error(f"Unexpected error: {str(e)}")
+                if attempt < 2:
+                    await asyncio.sleep(2 ** attempt)
+                continue
+            
+        logging.error(f"Failed to fetch content after 3 attempts: {url}")
         return None
 
     async def fetch_all(self):
-        """
-        (aio)获取所有文章
-        """
-        # 获取前50篇文章并记录总数
-        self.console.log(f"[bold green]Fetching the first {self.step} papers...")
-        self.console.print(f"[grey] {self.get_url(0)}")
-        content = await self.request(0)
-        self.papers.extend(self.parse_search_html(content))
-
-        # 获取剩余的内容
-        with Progress(
-            SpinnerColumn(),
-            *Progress.get_default_columns(),
-            TimeElapsedColumn(),
-            console=self.console,
-            transient=False,
-        ) as p:  # rich进度条
-            task = p.add_task(
-                description=f"[bold green]Fetching {self.total} results",
-                total=self.total,
-            )
-            p.update(task, advance=self.step)
-
-            async def wrapper(start):  # wrapper用于显示进度
-                # 异步请求网页，并解析其中的内容
-                content = await self.request(start)
-                papers = self.parse_search_html(content)
-                p.update(task, advance=self.step)
-                return papers
-
-            # 创建异步任务
-            fetch_tasks = []
-            for start in range(self.step, self.total, self.step):
-                fetch_tasks.append(wrapper(start))
-            papers_list = await asyncio.gather(*fetch_tasks)
-            self.papers.extend(chain(*papers_list))
-
-        self.console.log(f"[bold green]Fetching completed. ")
-        if self.trans_to:
-            await self.translate()
-        self.process_papers()
+        """获取所有论文"""
+        try:
+            self.console.log(f"[bold green]Fetching the first {self.step} papers...")
+            self.console.print(f"[grey] {self.get_url(0)}")
+            
+            # 第一次请求
+            content = await self.fetch_content(self.get_url(0))
+            if content is None:
+                self.console.log("[bold red]Failed to fetch initial content")
+                return
+                
+            # 解析总数
+            self.total = self.parse_total(content)
+            if self.total is None:
+                self.console.log("[bold red]Failed to parse total number of papers")
+                return
+                
+            self.console.log(f"Found {self.total} papers in total")
+            initial_papers = self.parse_search_html(content)
+            if initial_papers:
+                self.papers.extend(initial_papers)
+            
+            # 创建任务列表，每批次最多10个并发请求
+            batch_size = 10
+            with Progress() as progress:
+                task = progress.add_task("Fetching", total=self.total)
+                
+                for start in range(self.step, self.total, self.step * batch_size):
+                    batch_tasks = []
+                    for offset in range(0, min(self.step * batch_size, self.total - start), self.step):
+                        current_start = start + offset
+                        
+                        async def wrapper(current_start):
+                            content = await self.fetch_content(self.get_url(current_start))
+                            if content is None:
+                                self.console.log(f"[bold red]Failed to fetch content for start={current_start}")
+                                return None
+                            return self.parse_search_html(content)
+                            
+                        batch_tasks.append(wrapper(current_start))
+                    
+                    # 等待当前批次完成
+                    batch_results = await asyncio.gather(*batch_tasks)
+                    for papers in batch_results:
+                        if papers is not None:
+                            self.papers.extend(papers)
+                    
+                    # 更新进度
+                    progress.update(task, completed=min(start + self.step * batch_size, self.total))
+                    
+                    # 批次之间添加短暂延迟
+                    await asyncio.sleep(2)
+                    
+            self.console.log("Fetching completed.")
+            
+        except Exception as e:
+            self.console.log(f"[bold red]Error during fetch_all: {str(e)}")
+            raise
+            
+        finally:
+            await self.close_session()
 
     def fetch_update(self):
         """
@@ -235,7 +296,7 @@ class ArxivScraper(object):
                 )
 
     def update(self, start) -> bool:
-        content = asyncio.run(self.request(start))
+        content = asyncio.run(self.fetch_content(self.get_url(start)))
         self.papers.extend(self.parse_search_html(content))
         cnt_new = self.paper_db.count_new_papers(self.papers[start : start + self.step])
         if cnt_new < self.step:
@@ -248,135 +309,93 @@ class ArxivScraper(object):
         """
         解析搜索结果页面, 并将结果保存到self.paper_result中
         初次调用时, 会解析self.total
-
-        Args:
-            content (str): 网页内容
         """
-
-        """下面是一个搜索结果的例子
-        <li class="arxiv-result">
-            <div class="is-marginless">
-                <p class="list-title is-inline-block">
-                    <a href="https://arxiv.org/abs/physics/9403001">arXiv:physics/9403001</a>
-                    <span>&nbsp;[<a href="https://arxiv.org/pdf/physics/9403001">pdf</a>, <a
-                            href="https://arxiv.org/ps/physics/9403001">ps</a>, <a
-                            href="https://arxiv.org/format/physics/9403001">other</a>]&nbsp;</span>
-                </p>
-                <div class="tags is-inline-block">
-                    <span class="tag is-small is-link tooltip is-tooltip-top" data-tooltip="Popular Physics">
-                        physics.pop-ph</span>
-                    <span class="tag is-small is-grey tooltip is-tooltip-top"
-                        data-tooltip="High Energy Physics - Theory">hep-th</span>
-                </div>
-                <div class="is-inline-block" style="margin-left: 0.5rem">
-                    <div class="tags has-addons">
-                        <span class="tag is-dark is-size-7">doi</span>
-                        <span class="tag is-light is-size-7">
-                            <a class="" href="https://doi.org/10.1063/1.2814991">10.1063/1.2814991 <i
-                                    class="fa fa-external-link" aria-hidden="true"></i></a>
-                        </span>
-                    </div>
-                </div> 
-            </div>
-            <p class="title is-5 mathjax">
-                Desperately Seeking Superstrings
-            </p>
-            <p class="authors">
-                <span class="has-text-black-bis has-text-weight-semibold">Authors:</span>
-                    <a href="/search/?searchtype=author&amp;query=Ginsparg%2C+P">Paul Ginsparg</a>, <a href="/search/?searchtype=author&amp;query=Glashow%2C+S">Sheldon Glashow</a> 
-            </p> 
-            <p class="abstract mathjax">
-                <span class="has-text-black-bis has-text-weight-semibold">Abstract</span>: 
-                
-                <span class="abstract-short has-text-grey-dark mathjax" id="physics/9403001v1-abstract-short"
-                    style="display: inline;"> We provide a detailed analysis of the problems and prospects of superstring theory c.
-                1986, anticipating much of the progress of the decades to follow. </span>
-
-                <span class="abstract-full has-text-grey-dark mathjax" id="physics/9403001v1-abstract-full"
-                    style="display: none;"> We provide a detailed analysis of the problems and prospects of
-                superstring theory c. 1986, anticipating much of the progress of the decades to follow. 
-                <a class="is-size-7" style="white-space: nowrap;"
-                        onclick="document.getElementById('physics/9403001v1-abstract-full').style.display = 'none'; document.getElementById('physics/9403001v1-abstract-short').style.display = 'inline';">△ Less</a>
-                </span>
-            </p> 
-            <p class="is-size-7"><span class="has-text-black-bis has-text-weight-semibold">Submitted</span>
-                25 April, 1986; <span class="has-text-black-bis has-text-weight-semibold">originally
-                announced</span> March 1994. </p> 
-            <p class="comments is-size-7">
-                <span class="has-text-black-bis has-text-weight-semibold">Comments:</span>
-                <span class="has-text-grey-dark mathjax">originally appeared as a Reference Frame in Physics
-                    Today, May 1986</span>
-            </p> 
-            <p class="comments is-size-7">
-                <span class="has-text-black-bis has-text-weight-semibold">Journal ref:</span> Phys.Today
-                86N5 (1986) 7-9 </p> 
-        </li>
-        """
-
         if content is None:
+            self.console.log("[bold red]Cannot parse None content")
             return []
         
-        soup = BeautifulSoup(content, "html.parser")
-        if not self.total:
-            total = soup.select("#main-container > div.level.is-marginless > div.level-left > h1")[0].text
-            # "Showing 1–50 of 2,542,002 results" or "Sorry, your query returned no results"
-            if "Sorry" in total:
-                self.total = 0
-                return []
-            total = int(total[total.find("of") + 3 : total.find("results")].replace(",", ""))
-            self.total = total
+        try:
+            soup = BeautifulSoup(content, "html.parser")
+            if not self.total:
+                total_elements = soup.select("#main-container > div.level.is-marginless > div.level-left > h1")
+                if not total_elements:
+                    self.console.log("[bold red]Could not find total results element")
+                    self.total = 0
+                    return []
+                    
+                total = total_elements[0].text
+                self.console.log(f"[grey]Found total text: {total}")
+                
+                # "Showing 1–50 of 2,542,002 results" or "Sorry, your query returned no results"
+                if "Sorry" in total:
+                    self.total = 0
+                    return []
+                    
+                try:
+                    total = total[total.find("of") + 3 : total.find("results")].replace(",", "").strip()
+                    self.total = int(total)
+                except (ValueError, IndexError) as e:
+                    self.console.log(f"[bold red]Error parsing total: {str(e)}")
+                    self.total = 0
+                    return []
 
-        results = soup.find_all("li", {"class": "arxiv-result"})
-        papers = []
-        for result in results:
+            results = soup.find_all("li", {"class": "arxiv-result"})
+            papers = []
+            for result in results:
+                try:
+                    url_tag = result.find("a")
+                    url = url_tag["href"] if url_tag else "No link"
 
-            url_tag = result.find("a")
-            url = url_tag["href"] if url_tag else "No link"
+                    title_tag = result.find("p", class_="title")
+                    title = self.parse_search_text(title_tag) if title_tag else "No title"
+                    title = title.strip()
 
-            title_tag = result.find("p", class_="title")
-            title = self.parse_search_text(title_tag) if title_tag else "No title"
-            title = title.strip()
+                    date_tag = result.find("p", class_="is-size-7")
+                    date = date_tag.get_text(strip=True) if date_tag else "No date"
+                    if "v1" in date:
+                        v1 = date.find("v1submitted")
+                        date = date[v1 + 12 : date.find(";", v1)]
+                    else:
+                        submit_date = date.find("Submitted")
+                        date = date[submit_date + 9 : date.find(";", submit_date)]
 
-            date_tag = result.find("p", class_="is-size-7")
-            date = date_tag.get_text(strip=True) if date_tag else "No date"
-            if "v1" in date:
-                # Submitted9 August, 2024; v1submitted 8 August, 2024; originally announced August 2024.
-                # 注意空格会被吞掉，这里我们要找最早的提交日期
-                v1 = date.find("v1submitted")
-                date = date[v1 + 12 : date.find(";", v1)]
-            else:
-                # Submitted8 August, 2024; originally announced August 2024.
-                # 注意空格会被吞掉
-                submit_date = date.find("Submitted")
-                date = date[submit_date + 9 : date.find(";", submit_date)]
+                    category_tag = result.find_all("span", class_="tag")
+                    categories = [
+                        category.get_text(strip=True) 
+                        for category in category_tag 
+                        if "tooltip" in category.get("class", [])
+                    ]
 
-            category_tag = result.find_all("span", class_="tag")
-            categories = [
-                category.get_text(strip=True) for category in category_tag if "tooltip" in category.get("class")
-            ]
+                    authors_tag = result.find("p", class_="authors")
+                    authors = authors_tag.get_text(strip=True)[len("Authors:") :] if authors_tag else "No authors"
 
-            authors_tag = result.find("p", class_="authors")
-            authors = authors_tag.get_text(strip=True)[len("Authors:") :] if authors_tag else "No authors"
+                    summary_tag = result.find("span", class_="abstract-full")
+                    abstract = self.parse_search_text(summary_tag) if summary_tag else "No summary"
+                    abstract = abstract.strip()
 
-            summary_tag = result.find("span", class_="abstract-full")
-            abstract = self.parse_search_text(summary_tag) if summary_tag else "No summary"
-            abstract = abstract.strip()
+                    comments_tag = result.find("p", class_="comments")
+                    comments = comments_tag.get_text(strip=True)[len("Comments:") :] if comments_tag else "No comments"
 
-            comments_tag = result.find("p", class_="comments")
-            comments = comments_tag.get_text(strip=True)[len("Comments:") :] if comments_tag else "No comments"
-
-            papers.append(
-                Paper(
-                    url=url,
-                    title=title,
-                    first_submitted_date=datetime.strptime(date, "%d %B, %Y"),
-                    categories=categories,
-                    authors=authors,
-                    abstract=abstract,
-                    comments=comments,
-                )
-            )
-        return papers
+                    papers.append(
+                        Paper(
+                            url=url,
+                            title=title,
+                            first_submitted_date=datetime.strptime(date, "%d %B, %Y"),
+                            categories=categories,
+                            authors=authors,
+                            abstract=abstract,
+                            comments=comments,
+                        )
+                    )
+                except Exception as e:
+                    self.console.log(f"[bold red]Error parsing paper: {str(e)}")
+                    continue
+                    
+            return papers
+        except Exception as e:
+            self.console.log(f"[bold red]Error in parse_search_html: {str(e)}")
+            self.total = 0
+            return []
 
     def parse_search_text(self, tag):
         string = ""
@@ -422,6 +441,29 @@ class ArxivScraper(object):
 
     def to_csv(self, output_dir="./output_llms", filename_format="%Y-%m-%d",  header=False, csv_config={},):
         self.paper_exporter.to_csv(output_dir, filename_format, header, csv_config)
+
+    def parse_total(self, content):
+        """解析搜索结果总数"""
+        try:
+            # 使用BeautifulSoup解析HTML
+            soup = BeautifulSoup(content, 'html.parser')
+            
+            # 查找包含结果数量的元素
+            total_text = soup.find('h1', {'class': 'title'})
+            if total_text:
+                self.console.log(f"Found total text: {total_text.text.strip()}")
+                # 提取数字
+                match = re.search(r'Showing \d+–\d+ of ([\d,]+) results', total_text.text)
+                if match:
+                    total = int(match.group(1).replace(',', ''))
+                    return total
+                    
+            self.console.log("[bold red]Could not find total results count in the page")
+            return None
+            
+        except Exception as e:
+            self.console.log(f"[bold red]Error parsing total: {str(e)}")
+            return None
 
 
 import argparse

@@ -5,28 +5,26 @@ import logging
 from datetime import datetime
 from tqdm import tqdm
 from langchain_community.document_loaders import PDFPlumberLoader
-from volcenginesdkarkruntime import Ark
+from openai import OpenAI
 
-# 配置增强日志系统
-# 修改日志配置部分
+# 配置日志
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s',
     handlers=[
-        logging.FileHandler("paper_analysis.log", encoding='utf-8'),  # 添加编码参数
+        logging.FileHandler("paper_analysis.log", encoding='utf-8'),
         logging.StreamHandler()
     ]
 )
 logger = logging.getLogger(__name__)
 
-# 其他原有配置保持不变
-os.environ['ARK_API_KEY'] = ''
+# 修改为SiliconFlow配置
+os.environ['SILICON_API_KEY'] = ''  # 从 https://cloud.siliconflow.cn/account/ak 获取
 
-client = Ark(
-    base_url="https://ark.cn-beijing.volces.com/api/v3",
-    api_key=os.environ.get("ARK_API_KEY")
+client = OpenAI(
+    api_key=os.environ.get("SILICON_API_KEY"),
+    base_url="https://api.siliconflow.cn/v1"
 )
-
 
 def chat_v3(full_text, questions):
     results = []
@@ -40,26 +38,25 @@ def chat_v3(full_text, questions):
             问题：{question}
             请按问题要求直接给出答案"""
 
+            # 修改为使用SiliconFlow的API调用方式
             completion = client.chat.completions.create(
-                model="ep-20250206224347-2mshv",
+                model="deepseek-ai/DeepSeek-V2.5",  # 使用DeepSeek-V2.5模型
                 messages=[
                     {"role": "system", "content": sys_template},
                     {"role": "user", "content": user_question},
                 ],
+                temperature=0.01,
+                top_p=0.95,
+                stream=False,
+                max_tokens=4096
             )
             result = completion.choices[0].message.content
             results.append(result)
-            logger.info(f"成功处理问题: {question[:30]}...")  # 截断长问题
+            logger.info(f"成功处理问题: {question[:30]}...")
         except Exception as e:
             logger.error(f"处理问题时出错: {str(e)}")
             results.append("ERROR: 处理失败")
     return results
-
-
-
-
-
-# 其他配置保持不变...
 
 def update_analyse_database(questions, col_names, db_path: str = "papers.db"):
     """更新数据库并实时生成JSON输出"""
@@ -196,7 +193,6 @@ def load_pdf_content(file_path):
         logger.error(f"加载PDF失败: {file_path} - {str(e)}")
         return None
 
-
 if __name__ == "__main__":
     # 示例问题
     questions = [
@@ -215,22 +211,22 @@ if __name__ == "__main__":
         ,
 
         """
-        文档的主要研究内容是什么？回答这个问题是可相对详细一些，并侧重关注和考虑分析是否包含有“人格、性格(personality)”的部分,前提是有对应的内容,请你按以下格式输出：
+        文档的主要研究内容是什么？回答这个问题是可相对详细一些，并侧重关注和考虑分析是否包含有"人格、性格(personality)"的部分,前提是有对应的内容,请你按以下格式输出：
         主要内容: [文本描述]
         关于人格、性格: [文本描述]
 
-        请注意，关于人格、性格的内容如果没有，则标为“无”
+        请注意，关于人格、性格的内容如果没有，则标为"无"
         """
 
         ,
         """
-        论文使用的数据集有哪些？如果没有，则回答“无”，如果有请严格按以下格式列出：
+        论文使用的数据集有哪些？如果没有，则回答"无"，如果有请严格按以下格式列出：
         数据集: [数据集名称]
         数据集规模: [数据集规模]
         数据集形式: [数据集形式]
         地址: [数据集url]
 
-        如果上述格式对应的项（规模、形式、地址）没有，则标为“无”，请注意数据集名称不能为“无”
+        如果上述格式对应的项（规模、形式、地址）没有，则标为"无"，请注意数据集名称不能为"无"
         """
     ]
 

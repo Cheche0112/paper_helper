@@ -1,0 +1,12 @@
+aiohttp==3.9.1
+beautifulsoup4==4.12.2
+rich==13.7.0
+python-docx==1.0.1
+matplotlib==3.8.2
+pandas==2.1.4
+typing-extensions==4.9.0
+requests>=2.25.1
+tqdm>=4.65.0
+openai>=1.0.0
+langchain-community>=0.0.10
+pdfplumber>=0.10.0
